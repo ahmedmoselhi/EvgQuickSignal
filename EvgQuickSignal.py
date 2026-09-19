@@ -25,7 +25,50 @@ from enigma import iServiceInformation, iPlayableService, iPlayableServicePtr, e
 from threading import Thread
 import time
 import socket
+from datetime import datetime
 version = ' ver. 1.3'
+
+BISS_CAID = 0x2600
+BISS_KEY_FILES = (
+    '/etc/tuxbox/config/SoftCam.Key',
+    '/var/keys/SoftCam.Key',
+    '/usr/keys/SoftCam.Key',
+    '/etc/keys/SoftCam.Key',
+)
+
+def get_biss_key(service, reference):
+    """Return the configured BISS key for the currently playing service only."""
+    info = service and service.info()
+    if info is None:
+        return ''
+    try:
+        caids = info.getInfoObject(iServiceInformation.sCAIDs) or []
+        if BISS_CAID not in [int(caid) for caid in caids]:
+            return ''
+        fields = reference.toString().split(':') if reference else []
+        identifiers = set()
+        for index in (3, 4, 5):  # service ID, transport-stream ID, original-network ID
+            if len(fields) > index and fields[index]:
+                identifiers.add(fields[index].upper().zfill(4))
+    except:
+        return ''
+
+    for key_file in BISS_KEY_FILES:
+        try:
+            with open(key_file, 'r', errors='ignore') as key_data:
+                for line in key_data:
+                    tokens = line.split(';', 1)[0].split()
+                    if len(tokens) < 7 or tokens[0].upper() != 'F':
+                        continue
+                    # A BISS SoftCam.Key record contains SID, TSID and ONID before the CW.
+                    if identifiers and not identifiers.intersection(token.upper().zfill(4) for token in tokens[1:4]):
+                        continue
+                    key = ''.join(tokens[-1].split()).upper()
+                    if re.match(r'^[0-9A-F]{16}$', key):
+                        return key
+        except IOError:
+            continue
+    return ''
 def getsnr():
     if os.path.exists('/tmp/snr.dat') == True:
         try:
@@ -76,6 +119,7 @@ class EvgQuickSignalSAT(Screen):
         self['key_sat1'] = StaticText(' ')
         self['key_sat2'] = StaticText(' ')
         self['key_T2'] = StaticText(' ')
+        self['biss_key'] = StaticText(' ')
         self.onstart()
         self['actions'] = ActionMap(['OkCancelActions', 'DirectionActions', 'HelpActions', 'EPGSelectActions', 'ShortcutActions', 'WizardActions', 'ColorActions', 'MenuActions'], {'cancel': self.Exit, 'info': self.about, 'ok': self.OK, 'blue': self.bluebutton}, (-1))
     def bluebutton(self):
@@ -186,6 +230,9 @@ class EvgQuickSignalSAT(Screen):
         tunerb = tb1
         tunerb1 = tb2
         service = self.session.nav.getCurrentService()
+        biss_key = get_biss_key(service, self.session.nav.getCurrentlyPlayingServiceReference())
+        if biss_key:
+            self['biss_key'].setText('BISS key: ' + biss_key)
         info = service and service.info()
         orbital_pos = 0
         tunertype = ' '
@@ -708,56 +755,76 @@ class EvgQuickSignalT2MI(Screen):
         self['plp'] = StaticText(' ')
         self['str'] = StaticText(' ')
         self['astrasm'] = StaticText(' ')
-        self.n = 0
-        self.Data_Text = ''
-        self.t = 0
-        self.k = 19
-        self.newstr2 = []
+        self.log_lines = []
+        self.log_offset = 0
+        self.log_page_size = 19
+        self.log_follow_tail = True
         self.onstart()
-        self['actions'] = ActionMap(['OkCancelActions', 'DirectionActions', 'HelpActions', 'EPGSelectActions', 'ColorActions'], {'cancel': self.Exit, 'info': self.about, 'blue': self.bluebutton}, (-1))
+        self['actions'] = ActionMap(['OkCancelActions', 'DirectionActions', 'HelpActions', 'EPGSelectActions', 'ColorActions'], {'cancel': self.Exit, 'info': self.about, 'up': self.scrollUp, 'down': self.scrollDown, 'left': self.pageUp, 'right': self.pageDown, 'red': self.saveLog, 'blue': self.bluebutton}, (-1))
         self.SysUpdateTimer = eTimer()
         self.SysUpdateTimer.callback.append(self.updateSysInfo)
         self.onLayoutFinish.append(self.DataReader)
     def searchInfoFiles(self):
         lfile = '/tmp/astra.log'
-        if os.path.exists(lfile) == True:
-            with open(lfile, 'r', errors='ignore') as f:
-                count = sum((1 for _ in f))
-            f = open(lfile, 'r', errors='ignore')
-            data_lines = f.readlines()
-            f.close()
-            newstr = []
-            for i in data_lines:
-                newstr.append(i.rstrip())
-            countstr = []
-            n = 1
-            while n < len(newstr):
-                if '(*)' in newstr[n]:
-                    countstr.append(n)
-                n = n + 1
-            if len(countstr) > 0:
-                m = countstr[len(countstr) - 1] - 1
-            else:
-                m = 0
-            while m < count:
-                self.newstr2.append(newstr[m])
-                m = m + 1
+        if not os.path.exists(lfile):
+            self.log_lines = []
+            return
+        with open(lfile, 'r', errors='ignore') as log_file:
+            lines = [line.rstrip() for line in log_file]
+        markers = [index for index, line in enumerate(lines) if '(*)' in line]
+        self.log_lines = lines[markers[-1] - 1:] if markers else lines
+        last_page = max(0, len(self.log_lines) - self.log_page_size)
+        self.log_offset = last_page if self.log_follow_tail else min(self.log_offset, last_page)
     def DataReader(self):
         self.searchInfoFiles()
         self.updateSysInfo()
         self.SysUpdateTimer.start(200)
     def updateSysInfo(self):
+        self.searchInfoFiles()
+        self.showLogPage()
+
+    def showLogPage(self):
+        end = self.log_offset + self.log_page_size
+        self['str'].setText('\n'.join(self.log_lines[self.log_offset:end]))
+
+    def scrollUp(self):
+        self.log_follow_tail = False
+        self.log_offset = max(0, self.log_offset - 1)
+        self.showLogPage()
+
+    def scrollDown(self):
+        self.log_follow_tail = False
+        self.log_offset = min(max(0, len(self.log_lines) - self.log_page_size), self.log_offset + 1)
+        self.showLogPage()
+
+    def pageUp(self):
+        self.log_follow_tail = False
+        self.log_offset = max(0, self.log_offset - self.log_page_size)
+        self.showLogPage()
+
+    def pageDown(self):
+        self.log_follow_tail = False
+        self.log_offset = min(max(0, len(self.log_lines) - self.log_page_size), self.log_offset + self.log_page_size)
+        self.showLogPage()
+
+    def saveLog(self):
+        source = '/tmp/astra.log'
+        if not os.path.exists(source):
+            self.session.open(MessageBox, _('No T2MI log is available to save.'), MessageBox.TYPE_INFO)
+            return
+        destinations = ('/media/usb', '/media/hdd', '/media/mmc', '/media/net')
+        destination = next((path for path in destinations if os.path.isdir(path) and os.access(path, os.W_OK)), None)
+        if destination is None:
+            self.session.open(MessageBox, _('No writable external storage was found.'), MessageBox.TYPE_INFO)
+            return
+        filename = 'astra-%s.log' % datetime.now().strftime('%Y%m%d-%H%M%S')
+        target = os.path.join(destination, filename)
         try:
-            m = self.t
-            self.Data_Text = ''
-            while m < self.k:
-                self.Data_Text = self.Data_Text + '\n' + self.newstr2[m]
-                m = m + 1
-            self['str'].setText(str(self.Data_Text))
-            self.t = self.t + 1
-            self.k = self.k + 1
-        except:
-            pass
+            with open(source, 'rb') as input_file, open(target, 'wb') as output_file:
+                output_file.write(input_file.read())
+            self.session.open(MessageBox, _('T2MI log saved to ') + target, MessageBox.TYPE_INFO)
+        except IOError as error:
+            self.session.open(MessageBox, _('Could not save T2MI log: ') + str(error), MessageBox.TYPE_ERROR)
     def bluebutton(self):
         self.session.open(EvgQuickSignalBitrate)
     def onstart(self):
